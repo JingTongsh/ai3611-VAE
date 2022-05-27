@@ -68,7 +68,7 @@ class Decoder(nn.Module):
 
 class VAE(nn.Module):
     def __init__(self, latent_shape, device):
-        super().__init__()
+        super(VAE, self).__init__()
         self.latent_shape = latent_shape
         self.device = device
         self.enc = Encoder(out_shape=latent_shape, device=device)
@@ -93,12 +93,45 @@ class VAE(nn.Module):
         return out
 
 
+class SimpleVAE(nn.Module):
+    def __init__(self, latent_shape):
+        super(SimpleVAE, self).__init__()
+        self.enc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(in_features=28 ** 2, out_features=200),
+            nn.Tanh(),
+            nn.Linear(in_features=200, out_features=latent_shape)
+        )
+        self.dec = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(in_features=latent_shape, out_features=200),
+            nn.Tanh(),
+            nn.Linear(in_features=200, out_features=28 ** 2),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        z = self.enc(x)
+        out = self.dec(z)
+        out = out.view(-1, 1, 28, 28)
+        return z, out
+
+    def generate_from_img(self, x):
+        _, out = self.forward(x)
+        # out = (out > 0.5).float()
+        return out
+
+    def generate_from_latent(self, z):
+        out = self.dec(z)
+        return out
+
+
 def main():
     # Arguments
-    batch_size = 16
+    batch_size = 32
     device = 'cuda:0'
-    epochs = 10
-    latent_shape = 1
+    epochs = 40
+    latent_shape = 2
     learning_rate = 1e-3
     log_dir = './'
     save_dir = './'
@@ -112,12 +145,10 @@ def main():
     test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=batch_size, shuffle=False)
 
     # Initialize
-    model = VAE(latent_shape=latent_shape, device=device)
+    model = SimpleVAE(latent_shape=latent_shape)
     model.to(device)
     # writer = SummaryWriter(log_dir=log_dir)
     optim = torch.optim.SGD(params=model.parameters(), lr=learning_rate)
-    target = torch.zeros(batch_size, latent_shape + 1, latent_shape, requires_grad=False, device=device)
-    target[1:, :] = torch.eye(latent_shape)
 
     # Train
     print('Training ...')
@@ -129,27 +160,30 @@ def main():
             model.train()
             data = data.to(device)
             optim.zero_grad()
-            mu, sig, out = model.forward(data)
-            sig2 = sig ** 2
-
-            kl_divergence = -(1 + torch.log(sig2) - mu ** 2 - sig2).sum() / 2
+            latent, out = model.forward(data)
+            mu = latent.mean(dim=0)
+            sig = latent.T.cov()
+            kl_div = (-torch.log(sig.det()) - latent.shape[-1] + sig.trace() + mu.matmul(mu)) / 2
             rec_loss = F.mse_loss(out, data)
-            loss = kl_divergence + rec_loss
+            loss = kl_div + rec_loss
             loss.backward()
             optim.step()
 
-            epoch_loss[0] += kl_divergence.to('cpu')
-            epoch_loss[1] += rec_loss.to('cpu')
+            epoch_loss += torch.Tensor([kl_div, rec_loss], device='cpu')
 
+            if batch_idx == 0:
+                print('mean\n', latent.mean())
+                print('cov\n', latent.T.cov())
+                print('det\n', latent.T.cov().det())
             # writer.add_scalar('regularization', loss1, batch_idx)
             # writer.add_scalar('reconstruction', loss2, batch_idx)
             # writer.add_scalar('total', loss, batch_idx)
 
         duration = time.time() - start
-        print('| epoch {} | KL {:.2f} | neg likelihood {:.2f} | total loss {:.2f} | training time {:.2f} s |'
+        print('| epoch {} kl divergence {:.2f} | rec loss {:.2f} | total loss {:.2f} | training time {:.2f} s |'
               .format(epoch, epoch_loss[0], epoch_loss[1], epoch_loss.sum(), duration))
 
-        if epoch % 1 == 0:
+        if epoch % 5 == 0:
             print('Testing ...')
             start = time.time()
             test_dir = f'./test_images_{epoch}'
