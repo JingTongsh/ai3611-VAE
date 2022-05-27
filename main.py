@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
 from torch.distributions.multivariate_normal import MultivariateNormal
@@ -10,36 +11,43 @@ import time
 
 class Encoder(nn.Module):
     def __init__(self, out_shape, device):
-        super().__init__()
+        super(Encoder, self).__init__()
+        self.out_shape = out_shape
         self.net = nn.Sequential(
             nn.Conv2d(in_channels=1, out_channels=1, kernel_size=5),
-            nn.ReLU(),
+            # nn.BatchNorm2d(num_features=1),
+            nn.LeakyReLU(),
             nn.Conv2d(in_channels=1, out_channels=1, kernel_size=5),
-            nn.ReLU(),
+            # nn.BatchNorm2d(num_features=1),
+            nn.LeakyReLU(),
             nn.Flatten(),
             nn.Linear(in_features=400, out_features=200),
-            nn.ReLU(),
-            nn.Linear(in_features=200, out_features=out_shape ** 2 + out_shape)
+            nn.LeakyReLU(),
+            nn.Linear(in_features=200, out_features=out_shape * 2)
         )
         self.net.to(device)
 
     def forward(self, x):
-        out = self.net(x)
-        return out
+        batch_size = x.shape[0]
+        out = self.net(x).view(batch_size, 2, self.out_shape)
+        mu = out[:, 0, :]
+        sig = out[:, 1, :]
+        return mu, sig
 
 
 class Decoder(nn.Module):
     def __init__(self, in_shape, device):
-        super().__init__()
+        super(Decoder, self).__init__()
         self.fc = nn.Sequential(
             nn.Linear(in_features=in_shape, out_features=200),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Linear(in_features=200, out_features=400),
-            nn.ReLU()
+            nn.LeakyReLU()
         )
         self.ct = nn.Sequential(
             nn.ConvTranspose2d(in_channels=1, out_channels=1, kernel_size=5),
-            nn.ReLU(),
+            # nn.BatchNorm2d(num_features=1),
+            nn.LeakyReLU(),
             nn.ConvTranspose2d(in_channels=1, out_channels=1, kernel_size=5),
             nn.Sigmoid()
         )
@@ -48,12 +56,13 @@ class Decoder(nn.Module):
 
     def forward(self, z):
         z = self.fc(z)
-        out = self.ct(z.view(z.shape[0], 1, 20, 20))
+        z = z.view(z.shape[0], 1, 20, 20)
+        out = self.ct(z)
         return out
 
     def generate(self, z):
-        score = self.forward(z)
-        out = (score > 0.5).float()
+        out = self.forward(z)
+        # out = (out > 0.5).float()
         return out
 
 
@@ -68,23 +77,20 @@ class VAE(nn.Module):
                                            covariance_matrix=torch.eye(self.latent_shape))
 
     def forward(self, x):
-        para = self.enc(x).view(x.shape[0], self.latent_shape + 1, self.latent_shape)
-        ep = self.gaussian.sample(sample_shape=x.shape[0: 1]).view(-1, 1, self.latent_shape).to(self.device)
-        latent = para[:, 0, :] + ep.matmul(para[:, 1:, :]).view(-1, self.latent_shape)
+        mu, sig = self.enc(x)
+        ep = self.gaussian.sample(sample_shape=x.shape[0: 1]).to(self.device)
+        latent = mu + sig * ep
         out = self.dec(latent)
-        return para, out
+        return mu, sig, out
 
-    def generate(self, x):
-        _, score = self.forward(x)
-        out = (score > 0.5).float()
+    def generate_from_img(self, x):
+        _, _, out = self.forward(x)
+        # out = (out > 0.5).float()
         return out
 
-
-def kl_gaussian(mean1, cov1, mean2, cov2):
-    icov2 = torch.linalg.inv(cov2)  # torch.linalg.inv() not implemented in torch1.7.1+cu92
-    ret = torch.log(cov2.det() / cov1.det()) - mean1.shape[-1] + torch.trace(icov2.matmul(cov1)) \
-          + (mean2 - mean1).T.matmul(icov2).matmul(mean2 - mean1)
-    return ret / 2
+    def generate_from_latent(self, z):
+        out = self.dec(z)
+        return out
 
 
 def main():
@@ -108,9 +114,8 @@ def main():
     # Initialize
     model = VAE(latent_shape=latent_shape, device=device)
     model.to(device)
-    writer = SummaryWriter(log_dir=log_dir)
-    reconstruct = nn.BCELoss()
-    optimizer = torch.optim.SGD(params=model.parameters(), lr=learning_rate)
+    # writer = SummaryWriter(log_dir=log_dir)
+    optim = torch.optim.SGD(params=model.parameters(), lr=learning_rate)
     target = torch.zeros(batch_size, latent_shape + 1, latent_shape, requires_grad=False, device=device)
     target[1:, :] = torch.eye(latent_shape)
 
@@ -119,29 +124,32 @@ def main():
     for epoch in range(1, epochs + 1):
         start = time.time()
         epoch_loss = torch.zeros(2)
+
         for batch_idx, (data, _) in enumerate(train_loader):
             model.train()
             data = data.to(device)
-            optimizer.zero_grad()
-            para, out = model.forward(data)
-            loss1 = kl_gaussian(mean1=para[:, 0, :],
-                                cov1=para[:, 1:, :],
-                                mean2=torch.ones(latent_shape, device=device),
-                                cov2=torch.eye(latent_shape, device=device))
-            loss2 = reconstruct(out, data)
-            loss = loss1 + loss2
+            optim.zero_grad()
+            mu, sig, out = model.forward(data)
+            sig2 = sig ** 2
+
+            kl_divergence = -(1 + torch.log(sig2) - mu ** 2 - sig2).sum() / 2
+            rec_loss = F.mse_loss(out, data)
+            loss = kl_divergence + rec_loss
             loss.backward()
-            optimizer.step()
-            epoch_loss[0] += loss1.to('cpu')
-            epoch_loss[1] += loss2.to('cpu')
-            writer.add_scalar('regularization', loss1, batch_idx)
-            writer.add_scalar('reconstruction', loss2, batch_idx)
-            writer.add_scalar('total', loss, batch_idx)
+            optim.step()
+
+            epoch_loss[0] += kl_divergence.to('cpu')
+            epoch_loss[1] += rec_loss.to('cpu')
+
+            # writer.add_scalar('regularization', loss1, batch_idx)
+            # writer.add_scalar('reconstruction', loss2, batch_idx)
+            # writer.add_scalar('total', loss, batch_idx)
+
         duration = time.time() - start
         print('| epoch {} | KL {:.2f} | neg likelihood {:.2f} | total loss {:.2f} | training time {:.2f} s |'
               .format(epoch, epoch_loss[0], epoch_loss[1], epoch_loss.sum(), duration))
 
-        if epoch % 5 == 0:
+        if epoch % 1 == 0:
             print('Testing ...')
             start = time.time()
             test_dir = f'./test_images_{epoch}'
@@ -150,13 +158,13 @@ def main():
             model.eval()
             for batch_idx, (data, _) in enumerate(test_loader):
                 data = data.to(device)
-                images = model.generate(data)
+                images = model.generate_from_img(data)
                 img_name = f'image_{batch_idx}' + '.png'
                 save_image(images.view(data.size(0), 1, 28, 28),
                            os.path.join(test_dir, img_name),
-                           nrow=10)
+                           nrow=8)
             duration = time.time() - start
-            print('images saved to {}, test time {:.2f} s'.format(test_dir, duration))
+            print('images saved to {}/; test time {:.2f} s'.format(test_dir, duration))
 
 
 if __name__ == '__main__':
